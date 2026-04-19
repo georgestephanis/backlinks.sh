@@ -1,5 +1,7 @@
 # backlinks.sh
 
+> Built atop the original Common Crawl backlink work by [@retlehs](https://github.com/retlehs) — see the [original gist](https://gist.github.com/retlehs/cf0ac6c74476e766fba2f14076fff501).
+
 Find backlinks to any domain using [Common Crawl](https://commoncrawl.org/web-graphs) data — no third-party API keys, no rate limits, no monthly fees. Three composable scripts cover progressively more detail:
 
 | Script | What it answers | Data downloaded |
