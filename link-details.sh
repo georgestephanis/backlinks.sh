@@ -34,6 +34,7 @@ Options:
 Environment:
   CC_RELEASE     Common Crawl release (overrides ~/.config/cc-backlinks/config)
                  Default: cc-main-2026-jan-feb-mar
+  CC_PARALLEL    Parallel WARC fetches (default: 8)
 
 Cache:
   ~/.cache/cc-backlinks/<release>/link-details/<domain>/
@@ -60,15 +61,19 @@ CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
 CDX_CACHE="${CACHE}/cdx/${DOMAIN}"
 DETAILS_CACHE="${CACHE}/link-details/${DOMAIN}"
 CC_BASE="https://data.commoncrawl.org"
+PARALLEL="${CC_PARALLEL:-8}"
 
 mkdir -p "$DETAILS_CACHE"
+export DETAILS_CACHE CC_BASE DOMAIN
 
 # --- Write the Python WARC parser to a temp file ---
 # Written once, reused for every record. Parses gzip-compressed WARC
 # records and extracts links pointing to the target domain.
 
 PARSER=$(mktemp /tmp/cc-link-parser-XXXXXX.py)
-trap "rm -f '$PARSER'" EXIT
+FETCHER=$(mktemp /tmp/cc-link-fetcher-XXXXXX.sh)
+trap "rm -f '$PARSER' '$FETCHER'" EXIT
+export PARSER
 
 cat > "$PARSER" << 'PYEOF'
 import sys, gzip, re
@@ -132,53 +137,23 @@ for href, text, rel in p.links:
     print('\t'.join(cols))
 PYEOF
 
-# --- Process a single CDX record ---
+# --- Write the parallel WARC fetcher to a temp file ---
+# Called by xargs -P; receives parsed fields as positional args.
+# Writes output to the per-digest cache file, skipping if already present.
 
-process_record() {
-  local record="$1"
-
-  # Extract all needed fields from the CDX JSON in one python3 call.
-  local fields
-  fields=$(python3 -c '
-import json, sys, hashlib
-d      = json.loads(sys.argv[1])
-url    = d.get("url", "")
-ts     = d.get("timestamp", "")
-fn     = d.get("filename", "")
-offset = d.get("offset", "0")
-length = d.get("length", "0")
-# Use the CDX content digest as cache key; fall back to a hash of the URL.
-digest = d.get("digest", "") or hashlib.sha1(url.encode()).hexdigest()
-# Sanitise digest for use as a filename (CDX digests are "sha1:HASH" or just "HASH").
-digest = digest.replace("sha1:", "").replace("/", "_")
-print("\t".join([url, ts, fn, str(offset), str(length), digest]))
-' "$record") || return 0
-
-  local url ts filename offset length digest
-  IFS=$'\t' read -r url ts filename offset length digest <<<"$fields"
-
-  [[ -z "$filename" ]] && return 0
-
-  local cache_file="${DETAILS_CACHE}/${digest}.tsv"
-  if [[ -f "$cache_file" ]]; then
-    cat "$cache_file"
-    return 0
-  fi
-
-  # Show the URL being fetched before the network call — stderr passes
-  # through even inside a $() subshell, so this updates the terminal live.
-  printf '\r  [%d pages, %d links] fetching %-60s' "$DONE" "$FOUND" "$url" >&2
-
-  # WARC files on S3 contain individually gzip-compressed records.
-  # The CDX offset+length pinpoint the exact compressed record bytes.
-  local end=$(( offset + length - 1 ))
-  curl -sf -H "Range: bytes=${offset}-${end}" \
-    "${CC_BASE}/${filename}" \
-    | python3 "$PARSER" "$DOMAIN" "$url" "$ts" \
-    > "$cache_file" 2>/dev/null || true
-
-  cat "$cache_file"
-}
+cat > "$FETCHER" << 'FETCHEOF'
+#!/usr/bin/env bash
+url="$1" ts="$2" filename="$3" offset="$4" length="$5" digest="$6"
+cache_file="${DETAILS_CACHE}/${digest}.tsv"
+[[ -f "$cache_file" ]] && exit 0
+end=$(( offset + length - 1 ))
+tmp="${cache_file}.tmp.$$"
+curl -sf --max-time 30 -H "Range: bytes=${offset}-${end}" \
+  "${CC_BASE}/${filename}" \
+  | python3 "$PARSER" "$DOMAIN" "$url" "$ts" > "$tmp" 2>/dev/null || true
+[[ -f "$tmp" ]] && mv "$tmp" "$cache_file" 2>/dev/null || true
+FETCHEOF
+chmod +x "$FETCHER"
 
 # --- Determine input source ---
 # If stdin is a terminal (no pipe), read from the local CDX cache instead.
@@ -193,35 +168,53 @@ else
   INPUT="stdin"
 fi
 
-# --- Main loop ---
+# --- Three-phase execution ---
 
-printf 'source_url\tcrawl_date\ttarget_url\tanchor_text\trel\n'
+# Phase 1: parse all CDX records to tab-separated fields in one Python call.
+# Fields: url, timestamp, filename, offset, length, digest
 
-DONE=0
-FOUND=0
+PARSED=$(mktemp /tmp/cc-parsed-XXXXXX)
+trap "rm -f '$PARSER' '$FETCHER' '$PARSED'" EXIT
 
-run_loop() {
-  while IFS= read -r record; do
-    [[ -z "$record" ]] && continue
-    DONE=$(( DONE + 1 ))
-    printf '\r  [%d pages, %d links found]' "$DONE" "$FOUND" >&2
-    local results
-    results=$(process_record "$record") || true
-    if [[ -n "$results" ]]; then
-      printf '%s\n' "$results"
-      FOUND=$(( FOUND + $(printf '%s\n' "$results" | wc -l | tr -d ' ') ))
-      printf '\r  [%d pages, %d links found]' "$DONE" "$FOUND" >&2
-    fi
-  done
+collect_input() {
+  if [[ "$INPUT" == "stdin" ]]; then
+    cat
+  else
+    cat "${CDX_CACHE}"/*.jsonl 2>/dev/null || true
+  fi
 }
 
-if [[ "$INPUT" == "stdin" ]]; then
-  run_loop
-else
-  for cdx_file in "${CDX_CACHE}"/*.jsonl; do
-    [[ -f "$cdx_file" ]] || continue
-    run_loop < "$cdx_file"
-  done
-fi
+collect_input | python3 -c '
+import json, sys, hashlib
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+        url = d.get("url",""); ts = d.get("timestamp","")
+        fn = d.get("filename",""); offset = d.get("offset","0")
+        length = d.get("length","0")
+        digest = d.get("digest","") or hashlib.sha1(url.encode()).hexdigest()
+        digest = digest.replace("sha1:","").replace("/","_")
+        if fn: print("\t".join([url, ts, fn, str(offset), str(length), digest]))
+    except Exception: pass
+' > "$PARSED"
 
-printf '\n' >&2
+TOTAL=$(wc -l < "$PARSED" | tr -d ' ')
+printf '>> fetching %s pages (%s parallel)...\n' "$TOTAL" "$PARALLEL" >&2
+
+# Phase 2: fetch WARCs in parallel, each worker writing to its own cache file.
+xargs -P "$PARALLEL" -L 1 bash "$FETCHER" < "$PARSED" || true
+
+# Phase 3: emit results in input order by reading from cache files.
+printf 'source_url\tcrawl_date\ttarget_url\tanchor_text\trel\n'
+FOUND=0
+while IFS=$'\t' read -r _url _ts _fn _off _len digest; do
+  cache_file="${DETAILS_CACHE}/${digest}.tsv"
+  if [[ -f "$cache_file" ]]; then
+    cat "$cache_file"
+    FOUND=$(( FOUND + $(wc -l < "$cache_file" | tr -d ' ') ))
+  fi
+done < "$PARSED"
+
+printf '\n  %s pages, %s links found\n' "$TOTAL" "$FOUND" >&2
