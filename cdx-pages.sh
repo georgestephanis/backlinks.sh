@@ -9,6 +9,7 @@ set -euo pipefail
 # link-details.sh.
 
 DOMAIN="example.com"
+CLEAR_CDX=false
 
 usage() {
   cat <<'EOF'
@@ -25,6 +26,8 @@ Arguments:
   domain             Target domain (default: example.com)
 
 Options:
+  --clear-cdx        Delete cached CDX results for the domain before querying,
+                     forcing a fresh fetch. Does not affect the domain graph cache.
   -h, --help         Show this help message and exit
 
 Environment:
@@ -34,7 +37,8 @@ Environment:
                      (e.g. CC-MAIN-2026-04). Defaults to all crawls in the release.
   CDX_LIMIT          Max pages to fetch per domain per crawl (default: 500)
   CDX_MAX_DOMAINS    Only query the top N linking domains by host count (default: all)
-  CDX_TIMEOUT        Max seconds to wait for each CDX API call (default: 30)
+  CDX_TIMEOUT        Max seconds to wait for each CDX API call (default: 60)
+                     Connection timeout is half this value.
   CDX_DEBUG          Set to 1 to print per-request URLs, timing, and exit codes
 
 Cache:
@@ -49,6 +53,7 @@ EOF
 
 for arg in "$@"; do
   case "$arg" in
+    --clear-cdx) CLEAR_CDX=true ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "error: unknown option: $arg" >&2; exit 1 ;;
     *) DOMAIN="$arg" ;;
@@ -74,11 +79,17 @@ _CC_CONFIG="${HOME}/.config/cc-backlinks/config"
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 LIMIT="${CDX_LIMIT:-500}"
 MAX_DOMAINS="${CDX_MAX_DOMAINS:-0}"   # 0 = no limit
-TIMEOUT="${CDX_TIMEOUT:-30}"
+TIMEOUT="${CDX_TIMEOUT:-60}"
+CONNECT_TIMEOUT=$(( TIMEOUT / 2 ))
 DEBUG="${CDX_DEBUG:-}"
 CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
 CDX_CACHE="${CACHE}/cdx/${DOMAIN}"
 GRAPHINFO="${CACHE}/.graphinfo.json"
+
+if $CLEAR_CDX && [[ -d "$CDX_CACHE" ]]; then
+  echo ">> clearing CDX cache for ${DOMAIN} ..." >&2
+  find "$CDX_CACHE" -name '*.jsonl' -delete
+fi
 
 mkdir -p "$CDX_CACHE"
 
@@ -196,7 +207,7 @@ while IFS= read -r source_domain; do
       fi
       _t0=$(date +%s); _curl_rc=0
       curl -sGf \
-        --connect-timeout 10 \
+        --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$TIMEOUT" \
         "https://index.commoncrawl.org/${crawl_id}-index" \
         --data-urlencode "url=${source_domain}" \
