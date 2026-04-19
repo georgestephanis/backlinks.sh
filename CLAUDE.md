@@ -10,11 +10,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 ./backlinks.sh [--host] [domain]
+./backlinks.sh --cache-info
 ./backlinks.sh --help
 ```
 
 - Default domain is `example.com`
 - `CC_RELEASE` env var controls which Common Crawl snapshot is used (default: `cc-main-2026-jan-feb-mar`)
+- `--cache-info` prints disk usage per release and per dataset (domain vertices/edges, host shard counts), plus instructions for clearing or switching releases
 - See `--help` output for full usage, examples, and cache location
 
 ## Dependencies

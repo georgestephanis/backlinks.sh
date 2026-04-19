@@ -3,6 +3,7 @@ set -euo pipefail
 
 DOMAIN="example.com"
 HOST_MODE=false
+CACHE_INFO=false
 
 usage() {
   cat <<'EOF'
@@ -20,6 +21,9 @@ Options:
                   Results show individual subdomains (e.g. blog.site.com)
                   rather than just top-level domains. Downloads ~41 GB of
                   sharded data on first run.
+  --cache-info    Show local cache contents, disk usage, and instructions
+                  for clearing or switching to a newer release. Exits
+                  without querying.
   -h, --help      Show this help message and exit
 
 Environment:
@@ -39,14 +43,86 @@ Needs:  duckdb (brew install duckdb), curl, awk
 EOF
 }
 
+cache_info() {
+  local release="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
+  local base="${HOME}/.cache/cc-backlinks"
+
+  printf 'Cache: %s\n' "$base"
+  if [[ ! -d "$base" ]]; then
+    printf 'Total: (no cache found)\n\n'
+  else
+    printf 'Total: %s\n\n' "$(du -sh "$base" | cut -f1)"
+
+    local found_any=false
+    for rel_dir in "${base}"/*/; do
+      [[ -d "$rel_dir" ]] || continue
+      found_any=true
+      local rel
+      rel=$(basename "$rel_dir")
+      [[ "$rel" == "$release" ]] \
+        && printf '  %s  [active]\n' "$rel" \
+        || printf '  %s\n' "$rel"
+
+      # Domain-level single files
+      local dv="${rel_dir}domain-vertices.txt.gz"
+      local de="${rel_dir}domain-edges.txt.gz"
+      [[ -f "$dv" ]] \
+        && printf '    domain/vertices   %s\n' "$(du -sh "$dv" | cut -f1)" \
+        || printf '    domain/vertices   not downloaded\n'
+      [[ -f "$de" ]] \
+        && printf '    domain/edges      %s\n' "$(du -sh "$de" | cut -f1)" \
+        || printf '    domain/edges      not downloaded\n'
+
+      # Host-level shards: read shard totals from cached manifests if available,
+      # fall back to the known counts for the current dataset format.
+      local vm="${rel_dir}host/.vertices-manifest"
+      local em="${rel_dir}host/.edges-manifest"
+      local hv="${rel_dir}host/vertices"
+      local he="${rel_dir}host/edges"
+      local v_total=48 e_total=192
+      [[ -f "$vm" ]] && v_total=$(wc -l < "$vm" | tr -d ' ')
+      [[ -f "$em" ]] && e_total=$(wc -l < "$em" | tr -d ' ')
+
+      # Count downloaded shards without erroring if the directory/glob is empty.
+      local v_count e_count
+      v_count=$(shopt -s nullglob; arr=("${hv}"/*.gz); echo "${#arr[@]}")
+      e_count=$(shopt -s nullglob; arr=("${he}"/*.gz); echo "${#arr[@]}")
+
+      if [[ "$v_count" -gt 0 ]]; then
+        printf '    host/vertices     %d/%d shards, %s\n' "$v_count" "$v_total" "$(du -sh "$hv" | cut -f1)"
+      else
+        printf '    host/vertices     not downloaded\n'
+      fi
+      if [[ "$e_count" -gt 0 ]]; then
+        printf '    host/edges        %d/%d shards, %s\n' "$e_count" "$e_total" "$(du -sh "$he" | cut -f1)"
+      else
+        printf '    host/edges        not downloaded\n'
+      fi
+
+      printf '    subtotal          %s\n\n' "$(du -sh "$rel_dir" | cut -f1)"
+    done
+
+    $found_any || printf '  (no releases cached)\n\n'
+  fi
+
+  printf 'To clear one release:\n  rm -rf %s/<release>\n\n' "$base"
+  printf 'To clear everything:\n  rm -rf %s\n\n' "$base"
+  printf 'To switch to a newer release, set CC_RELEASE before running:\n'
+  printf '  CC_RELEASE=cc-main-YYYY-mon-mon-mon ./backlinks.sh [domain]\n\n'
+  printf 'Browse available releases: https://commoncrawl.org/web-graphs\n'
+}
+
 for arg in "$@"; do
   case "$arg" in
-    --host) HOST_MODE=true ;;
-    -h|--help) usage; exit 0 ;;
+    --host)       HOST_MODE=true ;;
+    --cache-info) CACHE_INFO=true ;;
+    -h|--help)    usage; exit 0 ;;
     -*) echo "error: unknown option: $arg" >&2; exit 1 ;;
     *) DOMAIN="$arg" ;;
   esac
 done
+
+if $CACHE_INFO; then cache_info; exit 0; fi
 
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
