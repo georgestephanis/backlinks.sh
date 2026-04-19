@@ -139,6 +139,20 @@ fi
 # Reverse domain: roots.io -> io.roots
 REV_DOMAIN=$(awk -F. '{for(i=NF;i>0;i--) printf "%s%s", $i, (i>1?".":"")}' <<<"$DOMAIN")
 
+# Animate a - \ | / spinner on stderr while a background PID is running,
+# then clear the line so the caller can print a final status.
+spin() {
+  local pid=$1 msg="${2:-}"
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s %s' "${_SPIN_FRAMES:$(( i % 4 )):1}" "$msg" >&2
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  printf '\r%80s\r' '' >&2   # clear the spinner line
+}
+_SPIN_FRAMES='-\|/'
+
 # Draw a [####----] done/total label progress bar in place.
 draw_progress() {
   local done=$1 total=$2 label="$3"
@@ -171,8 +185,14 @@ if ! $HOST_MODE; then
   echo ">> querying backlinks to ${DOMAIN} (reversed: ${REV_DOMAIN}) ..." >&2
   echo ">> first run scans ~16 GB of gzipped edges; expect several minutes" >&2
 
-  duckdb <<SQL
+  # Run DuckDB in the background so we can show a clean spinner instead of
+  # DuckDB's own progress output, which prints memory-usage lines that scroll.
+  # Results are buffered to a temp file and printed after the spinner clears.
+  local _result
+  _result=$(mktemp)
+  duckdb <<SQL > "$_result" &
 .mode box
+SET enable_progress_bar = false;
 WITH vertices AS (
   SELECT * FROM read_csv('${VERTICES}', delim='\t', header=false,
     columns={'id':'BIGINT','rev_domain':'VARCHAR','num_hosts':'BIGINT'})
@@ -192,6 +212,10 @@ FROM inbound i
 JOIN vertices v ON v.id = i.from_id
 ORDER BY v.num_hosts DESC, linking_domain;
 SQL
+  spin $! "scanning..."
+  wait $!
+  cat "$_result"
+  rm -f "$_result"
   exit 0
 fi
 
@@ -261,11 +285,13 @@ download_shards \
 echo ">> querying host-level backlinks to ${DOMAIN} ..." >&2
 echo ">> first run scans ~39 GB of gzipped edge shards; expect many minutes" >&2
 
-duckdb <<SQL
+_result=$(mktemp)
+duckdb <<SQL > "$_result" &
 .mode box
+SET enable_progress_bar = false;
 WITH vertices AS (
   SELECT * FROM read_csv('${HOST_CACHE}/vertices/*.gz', delim='\t', header=false,
-    columns={'id':'BIGINT','rev_host':'VARCHAR'})
+    columns={'id':'BIGINT','rev_host':'VARCHAR'}, ignore_errors=true)
 ),
 target AS (
   SELECT id FROM vertices
@@ -274,7 +300,7 @@ target AS (
 ),
 inbound AS (
   SELECT from_id FROM read_csv('${HOST_CACHE}/edges/*.gz', delim='\t', header=false,
-    columns={'from_id':'BIGINT','to_id':'BIGINT'})
+    columns={'from_id':'BIGINT','to_id':'BIGINT'}, ignore_errors=true)
   WHERE to_id IN (SELECT id FROM target)
 )
 SELECT
@@ -283,3 +309,7 @@ FROM inbound i
 JOIN vertices v ON v.id = i.from_id
 ORDER BY linking_host;
 SQL
+spin $! "scanning..."
+wait $!
+cat "$_result"
+rm -f "$_result"
