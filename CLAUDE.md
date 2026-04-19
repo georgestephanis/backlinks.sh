@@ -4,49 +4,72 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`backlinks.sh` is a single Bash script that finds all inbound backlinks to a domain by querying the [Common Crawl hyperlink graph](https://commoncrawl.org/web-graphs). It downloads gzipped vertex/edge data, caches it locally, and uses DuckDB for SQL queries.
+Three composable scripts that extract progressively more detail about backlinks to a domain using [Common Crawl](https://commoncrawl.org) data:
+
+| Script | Data source | Output |
+|---|---|---|
+| `backlinks.sh` | Hyperlink graph (domain or host level) | Linking domains/hosts + link count |
+| `cdx-pages.sh` | CDX index API | All crawled pages on linking domains (JSONL) |
+| `link-details.sh` | WARC records (byte-range fetch) | Anchor text, `rel` attribute, crawl date per link |
 
 ## Usage
 
 ```bash
-./backlinks.sh [--host] [domain]
+# Domain-level backlinks (downloads ~17 GB on first run)
+./backlinks.sh example.com
+
+# Host-level backlinks, subdomain granularity (downloads ~41 GB on first run)
+./backlinks.sh --host example.com
+
+# Show cache contents and disk usage
 ./backlinks.sh --cache-info
-./backlinks.sh --help
+
+# Full pipeline: domain graph → CDX pages → link details
+./backlinks.sh example.com          # run first to cache graph data
+./cdx-pages.sh example.com | ./link-details.sh example.com
+
+# Re-run link-details from cache (no re-fetching)
+./link-details.sh example.com > links.tsv
 ```
 
-- Default domain is `example.com`
-- `CC_RELEASE` env var controls which Common Crawl snapshot is used (default: `cc-main-2026-jan-feb-mar`)
-- `--cache-info` prints disk usage per release and per dataset (domain vertices/edges, host shard counts), plus instructions for clearing or switching releases
-- See `--help` output for full usage, examples, and cache location
+- Default domain is `example.com` for all three scripts
+- `CC_RELEASE` controls which Common Crawl snapshot is used (default: `cc-main-2026-jan-feb-mar`)
+- See `--help` on any script for full options, env vars, and cache location
 
 ## Dependencies
 
-- `duckdb` — must be installed (`brew install duckdb`); script checks and errors if missing
+- `duckdb` — required by `backlinks.sh` and `cdx-pages.sh` (`brew install duckdb`)
+- `python3` — required by `cdx-pages.sh` and `link-details.sh` (parses JSON; standard on macOS)
 - `curl`, `awk` — standard system tools
 
 ## Architecture
 
 ### Shared design
 
-- **Cache**: `~/.cache/cc-backlinks/<RELEASE>/`. Both `download()` and `download_shards()` skip files that already exist.
+- **Cache root**: `~/.cache/cc-backlinks/<RELEASE>/`. All three scripts skip already-downloaded files.
 - **Domain reversal**: Common Crawl stores names reversed (`roots.io` → `io.roots`). Done with `awk` before querying.
-- **DuckDB query**: A heredoc SQL query reads gzipped CSVs directly via `read_csv()` (DuckDB decompresses on the fly), finds the target's ID(s) in vertices, then joins inbound edges back to vertices to resolve names.
-- **`CC_RELEASE` env var**: Controls which Common Crawl snapshot is used. Update this when a newer release is available.
+- **`CC_RELEASE` env var**: Controls which snapshot all three scripts use. Update to switch releases.
 
-### Domain mode (default)
+### `backlinks.sh`
 
-Two single files downloaded via `download()`, which uses `curl --progress-bar` for a clean in-line progress bar:
-- `domain-vertices.txt.gz` (~850 MB, columns: `id, rev_domain, num_hosts`)
-- `domain-edges.txt.gz` (~16 GB, columns: `from_id, to_id`)
+**Domain mode (default):** Two single files, `domain-vertices.txt.gz` (~850 MB, columns: `id, rev_domain, num_hosts`) and `domain-edges.txt.gz` (~16 GB, columns: `from_id, to_id`), downloaded with `curl --progress-bar`. DuckDB reads them directly via `read_csv()` which decompresses gzip on the fly. Results sorted by `num_hosts` descending.
 
-Results sorted by `num_hosts` descending.
+**Host mode (`--host`):** The host-level graph is sharded — the `.paths.gz` files are manifests (one S3 path per line) pointing to the actual data shards. `download_shards()` fetches the manifest, identifies missing shards, then downloads 8 at a time via `xargs -P8`. Each completed curl appends one byte to a temp file; a polling loop counts bytes every 200 ms to drive a live `[####----] N/total` bar. DuckDB queries all shards via a glob. The target CTE matches both the exact host (`rev_host = 'io.roots'`) and all subdomains (`rev_host LIKE 'io.roots.%'`).
 
-### Host mode (`--host`)
+### `cdx-pages.sh`
 
-The host-level graph is sharded. The `.paths.gz` files from Common Crawl are manifests (one S3 path per line) pointing to the actual data shards, not the data itself:
-- Vertices: 48 shards (~2 GB total), columns: `id, rev_host` (no host count column)
-- Edges: 192 shards (~39 GB total), columns: `from_id, to_id`
+1. Fetches `https://index.commoncrawl.org/graphinfo.json` (cached as `.graphinfo.json`) and uses Python to extract the CDX crawl IDs for the current `CC_RELEASE`. Override with `CDX_CRAWL`.
+2. Runs a DuckDB query against the already-cached domain graph to get the list of linking domains, sorted by `num_hosts` descending. Cached as `cdx/<domain>/.linking-domains`.
+3. For each linking domain, queries each CDX crawl index (`https://index.commoncrawl.org/<CRAWL>-index`) using `matchType=domain` to cover all subdomains. Limited to `CDX_LIMIT` results per domain/crawl (default 500). Results cached as `cdx/<domain>/<source-domain>.jsonl`.
+4. Streams JSONL to stdout. Fields: `url, timestamp, filename, offset, length, digest, status, mime-detected`.
 
-`download_shards()` fetches the manifest, identifies missing shards, then downloads up to 8 in parallel via `xargs -P8`. Each completed curl appends one byte to a temp file; a polling loop counts those bytes every 200 ms to render a live `[####----] N/total` progress bar. DuckDB queries all cached shards via a glob (`vertices/*.gz`, `edges/*.gz`).
+### `link-details.sh`
 
-The target CTE matches both the exact host (`rev_host = 'io.roots'`) and all subdomains (`rev_host LIKE 'io.roots.%'`).
+Reads CDX JSONL from stdin (piped from `cdx-pages.sh`) or from the CDX cache when run interactively.
+
+For each record, checks `link-details/<domain>/<digest>.tsv` before fetching. If not cached:
+- Fetches the WARC record via HTTP byte-range (`Range: bytes=offset-(offset+length-1)`) against `https://data.commoncrawl.org/<filename>`. Common Crawl WARC files store records as individually gzip-compressed chunks, so the byte range returns a gzip stream.
+- Pipes through a Python script (written to a temp file at startup, shared across all records) that decompresses, splits WARC/HTTP headers from body, and runs `html.parser` to find all `<a href>` tags whose `href` contains the target domain. Extracts anchor text and `rel` attribute.
+- Writes per-page TSV to cache; cats to stdout.
+
+Output columns: `source_url`, `crawl_date`, `target_url`, `anchor_text`, `rel`.
