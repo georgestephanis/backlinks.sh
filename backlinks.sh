@@ -5,6 +5,10 @@ DOMAIN="example.com"
 HOST_MODE=false
 CACHE_INFO=false
 
+_CC_EXPLICIT="${CC_RELEASE:-}"
+_CC_CONFIG="${HOME}/.config/cc-backlinks/config"
+[[ -z "$_CC_EXPLICIT" && -f "$_CC_CONFIG" ]] && source "$_CC_CONFIG"
+
 usage() {
   cat <<'EOF'
 Usage: backlinks.sh [options] [domain]
@@ -27,8 +31,9 @@ Options:
   -h, --help      Show this help message and exit
 
 Environment:
-  CC_RELEASE      Common Crawl release to query
-                  (default: cc-main-2026-jan-feb-mar)
+  CC_RELEASE      Common Crawl release to query (overrides config file)
+                  Config: ~/.config/cc-backlinks/config
+                  Default: cc-main-2026-jan-feb-mar
 
 Cache:
   ~/.cache/cc-backlinks/<release>/
@@ -107,9 +112,48 @@ cache_info() {
 
   printf 'To clear one release:\n  rm -rf %s/<release>\n\n' "$base"
   printf 'To clear everything:\n  rm -rf %s\n\n' "$base"
-  printf 'To switch to a newer release, set CC_RELEASE before running:\n'
-  printf '  CC_RELEASE=cc-main-YYYY-mon-mon-mon ./backlinks.sh [domain]\n\n'
+  printf 'Release config: %s\n\n' "$_CC_CONFIG"
+  printf 'To switch releases, edit the config or run backlinks.sh (it checks for updates).\n'
+  printf 'To override once: CC_RELEASE=cc-main-YYYY-mon-mon-mon ./backlinks.sh [domain]\n\n'
   printf 'Browse available releases: https://commoncrawl.org/web-graphs\n'
+}
+
+check_for_newer_release() {
+  [[ -t 2 ]] || return 0                  # only when interactive
+  [[ -n "$_CC_EXPLICIT" ]] && return 0    # user explicitly set CC_RELEASE in env
+
+  local graphinfo="${HOME}/.cache/cc-backlinks/.graphinfo.json"
+  mkdir -p "${HOME}/.cache/cc-backlinks"
+
+  if [[ ! -f "$graphinfo" ]] || [[ -n "$(find "$graphinfo" -mmin +1440 2>/dev/null)" ]]; then
+    curl -sL --connect-timeout 5 --max-time 10 \
+      "https://index.commoncrawl.org/graphinfo.json" -o "$graphinfo" 2>/dev/null || return 0
+  fi
+
+  local latest
+  latest=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+if data:
+    print(data[-1]["id"])
+' "$graphinfo" 2>/dev/null) || return 0
+
+  [[ -n "$latest" && "$latest" != "$RELEASE" ]] || return 0
+
+  printf '\nNewer Common Crawl release available: %s\n' "$latest" >&2
+  printf 'Current release: %s\n' "$RELEASE" >&2
+  printf 'Update config to use newer release? [Y/n] ' >&2
+  local answer
+  read -r answer </dev/tty || return 0
+  case "${answer,,}" in
+    ''|y|yes)
+      mkdir -p "$(dirname "$_CC_CONFIG")"
+      printf 'CC_RELEASE=%s\n' "$latest" > "$_CC_CONFIG"
+      RELEASE="$latest"
+      printf 'Switched to %s.\n' "$latest" >&2
+      ;;
+  esac
 }
 
 for arg in "$@"; do
@@ -125,6 +169,7 @@ done
 if $CACHE_INFO; then cache_info; exit 0; fi
 
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
+check_for_newer_release
 CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
 BASE="https://data.commoncrawl.org/projects/hyperlinkgraph/${RELEASE}"
 CC_BASE="https://data.commoncrawl.org"

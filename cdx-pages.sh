@@ -28,7 +28,8 @@ Options:
   -h, --help         Show this help message and exit
 
 Environment:
-  CC_RELEASE         Common Crawl release (default: cc-main-2026-jan-feb-mar)
+  CC_RELEASE         Common Crawl release (overrides ~/.config/cc-backlinks/config)
+                     Default: cc-main-2026-jan-feb-mar
   CDX_CRAWL          Override which CDX crawl(s) to query, newline-separated
                      (e.g. CC-MAIN-2026-04). Defaults to all crawls in the release.
   CDX_LIMIT          Max pages to fetch per domain per crawl (default: 500)
@@ -68,6 +69,8 @@ spin() {
 }
 _SPIN_FRAMES='-\|/'
 
+_CC_CONFIG="${HOME}/.config/cc-backlinks/config"
+[[ -z "${CC_RELEASE:-}" && -f "$_CC_CONFIG" ]] && source "$_CC_CONFIG"
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 LIMIT="${CDX_LIMIT:-500}"
 MAX_DOMAINS="${CDX_MAX_DOMAINS:-0}"   # 0 = no limit

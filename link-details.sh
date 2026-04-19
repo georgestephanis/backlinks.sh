@@ -32,7 +32,8 @@ Options:
   -h, --help     Show this help message and exit
 
 Environment:
-  CC_RELEASE     Common Crawl release (default: cc-main-2026-jan-feb-mar)
+  CC_RELEASE     Common Crawl release (overrides ~/.config/cc-backlinks/config)
+                 Default: cc-main-2026-jan-feb-mar
 
 Cache:
   ~/.cache/cc-backlinks/<release>/link-details/<domain>/
@@ -52,6 +53,8 @@ for arg in "$@"; do
   esac
 done
 
+_CC_CONFIG="${HOME}/.config/cc-backlinks/config"
+[[ -z "${CC_RELEASE:-}" && -f "$_CC_CONFIG" ]] && source "$_CC_CONFIG"
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
 CDX_CACHE="${CACHE}/cdx/${DOMAIN}"
