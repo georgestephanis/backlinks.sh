@@ -33,6 +33,8 @@ Environment:
                      (e.g. CC-MAIN-2026-04). Defaults to all crawls in the release.
   CDX_LIMIT          Max pages to fetch per domain per crawl (default: 500)
   CDX_MAX_DOMAINS    Only query the top N linking domains by host count (default: all)
+  CDX_TIMEOUT        Max seconds to wait for each CDX API call (default: 30)
+  CDX_DEBUG          Set to 1 to print per-request URLs, timing, and exit codes
 
 Cache:
   ~/.cache/cc-backlinks/<release>/cdx/<domain>/
@@ -69,6 +71,8 @@ _SPIN_FRAMES='-\|/'
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 LIMIT="${CDX_LIMIT:-500}"
 MAX_DOMAINS="${CDX_MAX_DOMAINS:-0}"   # 0 = no limit
+TIMEOUT="${CDX_TIMEOUT:-30}"
+DEBUG="${CDX_DEBUG:-}"
 CACHE="${HOME}/.cache/cc-backlinks/${RELEASE}"
 CDX_CACHE="${CACHE}/cdx/${DOMAIN}"
 GRAPHINFO="${CACHE}/.graphinfo.json"
@@ -178,16 +182,38 @@ while IFS= read -r source_domain; do
     while IFS= read -r crawl_id; do
       [[ -z "$crawl_id" ]] && continue
       _n=$(( _n + 1 ))
-      printf '\r  [%d/%d] %-40s  querying crawl %d/%d (%s)%10s' \
-        "$DONE" "$TOTAL" "$source_domain" "$_n" "$CRAWL_TOTAL" "$crawl_id" "" >&2
-      curl -sGf "https://index.commoncrawl.org/${crawl_id}-index" \
+      if [[ -n "$DEBUG" ]]; then
+        printf '\n  [%d/%d] %s  crawl %d/%d (%s)\n' \
+          "$DONE" "$TOTAL" "$source_domain" "$_n" "$CRAWL_TOTAL" "$crawl_id" >&2
+        printf '    GET https://index.commoncrawl.org/%s-index?url=%s&matchType=domain&limit=%s\n' \
+          "$crawl_id" "$source_domain" "$LIMIT" >&2
+      else
+        printf '\r  [%d/%d] %-40s  querying crawl %d/%d (%s)%10s' \
+          "$DONE" "$TOTAL" "$source_domain" "$_n" "$CRAWL_TOTAL" "$crawl_id" "" >&2
+      fi
+      _t0=$(date +%s); _curl_rc=0
+      curl -sGf \
+        --connect-timeout 10 \
+        --max-time "$TIMEOUT" \
+        "https://index.commoncrawl.org/${crawl_id}-index" \
         --data-urlencode "url=${source_domain}" \
         --data-urlencode "matchType=domain" \
         --data-urlencode "output=json" \
         --data-urlencode "fl=url,timestamp,filename,offset,length,digest,status,mime-detected" \
         --data-urlencode "filter=status:200" \
         --data-urlencode "filter=mime-detected:text/html" \
-        --data-urlencode "limit=${LIMIT}" || true
+        --data-urlencode "limit=${LIMIT}" || _curl_rc=$?
+      _t1=$(date +%s); _elapsed=$(( _t1 - _t0 ))
+      if [[ "$_curl_rc" -eq 22 ]]; then
+        # HTTP 4xx/5xx — CDX has no records for this domain/crawl; this is normal.
+        [[ -n "$DEBUG" ]] && printf '    no results (%ds)\n' "$_elapsed" >&2
+      elif [[ "$_curl_rc" -ne 0 ]]; then
+        # Unexpected failure (exit 28 = timeout, exit 6 = DNS failure, etc.)
+        printf '\r  WARNING: CDX request failed (exit %d, %ds) for %s [%s]%20s\n' \
+          "$_curl_rc" "$_elapsed" "$source_domain" "$crawl_id" "" >&2
+      elif [[ -n "$DEBUG" ]]; then
+        printf '    OK (%ds)\n' "$_elapsed" >&2
+      fi
     done <<<"$CRAWL_IDS"
   } | grep -v '^$' | tee "$PAGE_CACHE"
 
