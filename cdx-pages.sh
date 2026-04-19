@@ -37,6 +37,7 @@ Environment:
                      (e.g. CC-MAIN-2026-04). Defaults to all crawls in the release.
   CDX_LIMIT          Max pages to fetch per domain per crawl (default: 500)
   CDX_MAX_DOMAINS    Only query the top N linking domains by host count (default: all)
+  CDX_MIN_HOSTS      Skip linking domains with fewer than N linking hosts (default: 0)
   CDX_TIMEOUT        Max seconds to wait for each CDX API call (default: 60)
                      Connection timeout is half this value.
   CDX_DEBUG          Set to 1 to print per-request URLs, timing, and exit codes
@@ -79,6 +80,7 @@ _CC_CONFIG="${HOME}/.config/cc-backlinks/config"
 RELEASE="${CC_RELEASE:-cc-main-2026-jan-feb-mar}"
 LIMIT="${CDX_LIMIT:-500}"
 MAX_DOMAINS="${CDX_MAX_DOMAINS:-0}"   # 0 = no limit
+MIN_HOSTS="${CDX_MIN_HOSTS:-0}"       # 0 = no filter
 TIMEOUT="${CDX_TIMEOUT:-60}"
 CONNECT_TIMEOUT=$(( TIMEOUT / 2 ))
 DEBUG="${CDX_DEBUG:-}"
@@ -136,7 +138,9 @@ if [[ ! -f "$VERTICES" || ! -f "$EDGES" ]]; then
 fi
 
 REV_DOMAIN=$(awk -F. '{for(i=NF;i>0;i--) printf "%s%s", $i, (i>1?".":"")}' <<<"$DOMAIN")
-DOMAINS_CACHE="${CDX_CACHE}/.linking-domains"
+[[ "$MIN_HOSTS" -gt 0 ]] \
+  && DOMAINS_CACHE="${CDX_CACHE}/.linking-domains.min${MIN_HOSTS}" \
+  || DOMAINS_CACHE="${CDX_CACHE}/.linking-domains"
 
 if [[ ! -f "$DOMAINS_CACHE" ]]; then
   echo ">> finding domains linking to ${DOMAIN} ..." >&2
@@ -160,6 +164,7 @@ inbound AS (
 SELECT array_to_string(list_reverse(string_split(v.rev_domain, '.')), '.') AS domain
 FROM inbound i
 JOIN vertices v ON v.id = i.from_id
+WHERE v.num_hosts >= ${MIN_HOSTS}
 ORDER BY v.num_hosts DESC, domain;
 SQL
   DDB_PID=$!
